@@ -2113,19 +2113,35 @@ def _slim_entry(e):
     is_playlist = e.get("_type") == "playlist" or (
         isinstance(entry_id, str) and entry_id.startswith(_PLAYLIST_ID_PREFIXES) and len(entry_id) > 12
     )
+    duration = e.get("duration")
+    # ショート動画の簡易判定: 60秒以下、かつURLに/shorts/を含む(yt-dlpがそう教えてくれる
+    # ことがある)か、アスペクト比が縦長(width < height)であることが分かる場合。
+    # 完全な判定はできないが、既存のフィールドだけで実用上十分な精度が出る。
+    url = e.get("url") or e.get("webpage_url") or ""
+    is_short = bool(
+        duration and duration <= 60 and (
+            "/shorts/" in url
+            or (e.get("thumbnails") and any(
+                t.get("width") and t.get("height") and t["width"] < t["height"]
+                for t in thumbnails
+            ))
+        )
+    )
     return {
         "video_id": entry_id,
         "title": e.get("title"),
         "url": e.get("url") or e.get("webpage_url"),
-        "duration": e.get("duration"),
+        "duration": duration,
         "view_count": e.get("view_count"),
         "channel": e.get("channel") or e.get("uploader"),
         "channel_id": e.get("channel_id") or e.get("uploader_id"),
         "thumbnail": thumbnail,
         "live_status": e.get("live_status"),
+        "release_timestamp": e.get("release_timestamp"),
         "upload_date": e.get("upload_date"),
         "entry_type": "playlist" if is_playlist else "video",
         "video_count": e.get("playlist_count") if is_playlist else None,
+        "is_short": is_short,
     }
 
 
@@ -4010,6 +4026,23 @@ def _find_first_image_sources(node):
     return None
 
 
+def _parse_duration_text(text):
+    """
+    "1:23" や "12:34:56" のような表示用の長さ文字列を秒数に変換する。
+    パースできない場合(空文字・"LIVE"等の非数値表記)はNoneを返す。
+    """
+    if not text or not isinstance(text, str):
+        return None
+    parts = text.strip().split(":")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    parts = [int(p) for p in parts]
+    seconds = 0
+    for p in parts:
+        seconds = seconds * 60 + p
+    return seconds
+
+
 def _parse_lockup_view_model(node):
     """
     YouTubeの新しいUI形式(lockupViewModel)を解析する。
@@ -4092,6 +4125,13 @@ def _parse_lockup_view_model(node):
         if digits:
             video_count = int(digits)
 
+    duration = _parse_duration_text(length_text) if length_text else None
+    # ショート判定: 60秒以下の動画、かつ再生リストではないもの。
+    # lockupViewModel自体にショート専用のフラグは無いため、長さだけで簡易判定している
+    # (関連動画・トレンド一覧に出てくる普通の短尺動画も稀に含まれてしまう可能性はあるが、
+    # 実用上はこれで十分な精度が出る)。
+    is_short = bool(not is_playlist and duration is not None and duration <= 60)
+
     return {
         "video_id": content_id,
         "title": title,
@@ -4099,6 +4139,8 @@ def _parse_lockup_view_model(node):
         "channel_id": channel_id,
         "channel_thumbnail": channel_avatar,
         "length_text": length_text,
+        "duration": duration,
+        "is_short": is_short,
         "view_count_text": views_text,
         "thumbnail": thumbnail_url,
         "entry_type": "playlist" if is_playlist else "video",
@@ -4206,6 +4248,46 @@ def _parse_video_cards(yt_data, exclude_id, limit):
                 break
             continue
 
+        # チャンネルカード(検索結果に出てくる「チャンネル」のカード)。
+        # 動画/再生リストとは全く別の形式(channelId基準、videoIdを持たない)なので、
+        # ここで別枠として拾い、entry_type: "channel" として返す。
+        channel_node = node.get("channelRenderer")
+        if channel_node is not None:
+            channel_id = channel_node.get("channelId")
+            if not channel_id or channel_id in seen:
+                continue
+            title = _runs_text(channel_node.get("title"))
+            if not title:
+                continue
+            seen.add(channel_id)
+
+            thumb_sources = _dig(channel_node, "thumbnail", "thumbnails") or _find_first_image_sources(channel_node) or []
+            thumbnail_url = thumb_sources[-1]["url"] if thumb_sources else None
+            if thumbnail_url and thumbnail_url.startswith("//"):
+                thumbnail_url = "https:" + thumbnail_url
+
+            subscriber_text = _dig(channel_node, "subscriberCountText", "simpleText") or _runs_text(channel_node.get("subscriberCountText"))
+            video_count_text = _runs_text(channel_node.get("videoCountText"))
+
+            entries.append({
+                "video_id": channel_id,
+                "title": title,
+                "channel": title,
+                "channel_id": channel_id,
+                "channel_thumbnail": thumbnail_url,
+                "length_text": None,
+                "view_count_text": None,
+                "subscriber_count_text": subscriber_text,
+                "video_count_text": video_count_text,
+                "thumbnail": thumbnail_url,
+                "entry_type": "channel",
+                "video_count": None,
+                "url": f"https://www.youtube.com/channel/{channel_id}",
+            })
+            if len(entries) >= limit:
+                break
+            continue
+
         if not _looks_like_video(node):
             continue
 
@@ -4228,6 +4310,9 @@ def _parse_video_cards(yt_data, exclude_id, limit):
                 break
 
         thumbnails = _dig(node, "thumbnail", "thumbnails") or []
+        length_text = _dig(node, "lengthText", "simpleText")
+        duration = _parse_duration_text(length_text) if length_text else None
+        is_short = bool(duration is not None and duration <= 60)
 
         entries.append({
             "video_id": video_id,
@@ -4235,7 +4320,9 @@ def _parse_video_cards(yt_data, exclude_id, limit):
             "channel": _runs_text(node.get("longBylineText") or node.get("shortBylineText")),
             "channel_id": channel_id,
             "channel_thumbnail": channel_thumbnail,
-            "length_text": _dig(node, "lengthText", "simpleText"),
+            "length_text": length_text,
+            "duration": duration,
+            "is_short": is_short,
             "view_count_text": _dig(node, "shortViewCountText", "simpleText") or _runs_text(node.get("viewCountText")),
             "thumbnail": thumbnails[-1]["url"] if thumbnails else None,
             "url": f"https://www.youtube.com/watch?v={video_id}",
@@ -4449,15 +4536,65 @@ def _build_stream_payload(video_id, data, include_info=True, channel_avatar_url=
     formats = data.get("formats") or []
     streams = []
     hls_url = None
+    has_combined = False
     for f in formats:
         entry = {k: f.get(k) for k in _STREAM_FIELDS}
         streams.append(entry)
         protocol = f.get("protocol") or ""
         if hls_url is None and "m3u8" in protocol:
             hls_url = f.get("url")
+        vcodec = f.get("vcodec") or "none"
+        acodec = f.get("acodec") or "none"
+        if vcodec != "none" and acodec != "none":
+            has_combined = True
 
     if hls_url is None:
         hls_url = data.get("manifest_url")
+
+    # 映像+音声が一体になったフォーマットが1つも無い動画がまれにある
+    # (実機で確認済み: web_embeddedクライアントだと、動画によっては
+    # video-only/audio-onlyしか返ってこないことがある)。以前はこの場合
+    # 「再生可能なフォーマットが見つかりません」と諦めてエラーにしていたが、
+    # それだと「絶対に再生できるはず」という期待に応えられない。
+    # 一時ダウンロード無しでその場で結合できるFFmpeg合成エンドポイント
+    # (/api/muxed-stream)が既にあるので、combinedが無い場合は自動的に
+    # 「合成ストリーム」を選択肢に追加し、これがそのまま再生できるように
+    # フロントエンド側に案内する。
+    if not has_combined and not hls_url:
+        video_only = [f for f in formats if f.get("url") and (f.get("vcodec") or "none") != "none" and (f.get("acodec") or "none") == "none"]
+        audio_only = [f for f in formats if f.get("url") and (f.get("vcodec") or "none") == "none" and (f.get("acodec") or "none") != "none"]
+        if video_only and audio_only:
+            video_only.sort(key=lambda f: f.get("height") or 0, reverse=True)
+            best_video = video_only[0]
+            streams.append({
+                "format_id": f"muxed-{best_video.get('format_id')}",
+                "format_note": "自動合成(映像+音声をその場で結合)",
+                "ext": "mp4",
+                "resolution": best_video.get("resolution"),
+                "width": best_video.get("width"),
+                "height": best_video.get("height"),
+                "fps": best_video.get("fps"),
+                "vcodec": best_video.get("vcodec"),
+                "acodec": "muxed",
+                "abr": None, "vbr": best_video.get("vbr"), "tbr": best_video.get("tbr"),
+                "asr": None, "audio_channels": None,
+                "filesize": None, "filesize_approx": None,
+                "protocol": "muxed", "container": "mp4", "dynamic_range": best_video.get("dynamic_range"),
+                "language": None, "quality": best_video.get("quality"),
+                "url": f"/api/muxed-stream/{video_id}?format_id={best_video.get('format_id')}",
+            })
+            log("access", f"combinedフォーマットが無かったため合成ストリームで補完(video_id={video_id}, video_format={best_video.get('format_id')})", "yellow")
+
+    if not has_combined and not hls_url and not any(s.get("format_id", "").startswith("muxed-") for s in streams):
+        # ここまでで結局「実際に再生できるもの」が何も無かった場合のみ、診断用に
+        # フォーマット一覧を丸ごとログに残す。「たまに再生できるフォーマットが
+        # 見つからない」問題を追跡するための情報(mhtml等のダミーフォーマットしか
+        # 無いケースもここに含まれる)。
+        format_summary = [
+            {"id": f.get("format_id"), "protocol": f.get("protocol"), "vcodec": f.get("vcodec"), "acodec": f.get("acodec"), "url_present": bool(f.get("url"))}
+            for f in formats
+        ]
+        log("access", f"再生可能なフォーマットが本当に1つも無かった(video_id={video_id}): {format_summary}", "red")
 
     result = {
         "video_id": data.get("id") or video_id,
