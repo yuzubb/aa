@@ -785,6 +785,7 @@ def _init_db():
                 channel_thumbnail TEXT,
                 duration INTEGER,
                 view_count INTEGER NOT NULL DEFAULT 0,
+                is_short INTEGER NOT NULL DEFAULT 0,
                 watched_at REAL NOT NULL
             )
         """)
@@ -811,6 +812,7 @@ def _init_db():
                     channel_thumbnail TEXT,
                     duration INTEGER,
                     view_count INTEGER NOT NULL DEFAULT 0,
+                    is_short INTEGER NOT NULL DEFAULT 0,
                     watched_at REAL NOT NULL
                 )
             """)
@@ -819,6 +821,8 @@ def _init_db():
                 conn.execute("ALTER TABLE watch_history ADD COLUMN channel_thumbnail TEXT")
             if "view_count" not in existing_cols:
                 conn.execute("ALTER TABLE watch_history ADD COLUMN view_count INTEGER NOT NULL DEFAULT 1")
+            if "is_short" not in existing_cols:
+                conn.execute("ALTER TABLE watch_history ADD COLUMN is_short INTEGER NOT NULL DEFAULT 0")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_subscriptions (
@@ -980,8 +984,8 @@ def _record_watch_history(entry):
     with _CACHE_DB_LOCK, _db() as conn:
         conn.execute("""
             INSERT INTO watch_history
-                (video_id, title, thumbnail, channel, channel_id, channel_thumbnail, duration, view_count, watched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                (video_id, title, thumbnail, channel, channel_id, channel_thumbnail, duration, is_short, view_count, watched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(video_id) DO UPDATE SET
                 title=excluded.title,
                 thumbnail=excluded.thumbnail,
@@ -989,11 +993,13 @@ def _record_watch_history(entry):
                 channel_id=excluded.channel_id,
                 channel_thumbnail=excluded.channel_thumbnail,
                 duration=excluded.duration,
+                is_short=excluded.is_short,
                 view_count=watch_history.view_count + 1,
                 watched_at=excluded.watched_at
         """, (
             video_id, entry.get("title"), entry.get("thumbnail"), entry.get("channel"),
-            entry.get("channel_id"), entry.get("channel_thumbnail"), entry.get("duration"), now,
+            entry.get("channel_id"), entry.get("channel_thumbnail"), entry.get("duration"),
+            1 if entry.get("is_short") else 0, now,
         ))
         conn.execute("""
             DELETE FROM watch_history WHERE video_id NOT IN (
@@ -1006,7 +1012,7 @@ def _get_watch_history(limit):
     with _db() as conn:
         rows = conn.execute(
             "SELECT video_id, title, thumbnail, channel, channel_id, channel_thumbnail, duration, "
-            "view_count, watched_at FROM watch_history ORDER BY watched_at DESC LIMIT ?",
+            "is_short, view_count, watched_at FROM watch_history ORDER BY watched_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -2127,6 +2133,22 @@ def _slim_entry(e):
             ))
         )
     )
+    # channel_idは本来 "UCxxxxxxxx" 形式のはずだが、yt-dlpのuploader_idは
+    # "@handle" 形式(ハンドル名)で入ってくることがある。channel_idが無い場合の
+    # フォールバックとしてuploader_idをそのまま使うと、意味の異なる値
+    # (本来のIDではなくハンドル名)が混ざってしまうため、uploader_idがUC形式
+    # (本物のchannel_id)である場合だけフォールバックとして採用する。
+    # それも無ければ、最後の手段としてハンドル名でも構わず使う
+    # (/channel/{channel_id}ルート自体はハンドル名でも解決できるため実害は無い)。
+    fallback_uploader_id = e.get("uploader_id")
+    if fallback_uploader_id and fallback_uploader_id.startswith("UC"):
+        channel_id_value = e.get("channel_id") or fallback_uploader_id
+    else:
+        # uploader_idが"@handle"形式(本来のchannel_idではない)の場合は
+        # フォールバックとして採用しない。channel_id自体が取れていれば
+        # それを使い、無ければNoneのままにする(ハンドルを紛れ込ませない)。
+        channel_id_value = e.get("channel_id")
+
     return {
         "video_id": entry_id,
         "title": e.get("title"),
@@ -2134,7 +2156,7 @@ def _slim_entry(e):
         "duration": duration,
         "view_count": e.get("view_count"),
         "channel": e.get("channel") or e.get("uploader"),
-        "channel_id": e.get("channel_id") or e.get("uploader_id"),
+        "channel_id": channel_id_value,
         "thumbnail": thumbnail,
         "live_status": e.get("live_status"),
         "release_timestamp": e.get("release_timestamp"),
